@@ -1,20 +1,21 @@
-from nobuco.commons import ChannelOrderingStrategy, ChannelOrder, TF_TENSOR_CLASSES
+import tensorflow as tf
+from tensorflow import keras
+from nobuco.commons import ChannelOrder, ChannelOrderingStrategy, TF_TENSOR_CLASSES
 from nobuco.converters.channel_ordering import set_channel_order, get_channel_order
 from nobuco.converters.scalars_to_tensors import tf_scalars_to_tensors_recursively
 from nobuco.converters.tensor import _permute, perm_keras2pytorch, perm_pytorch2keras
 from nobuco.converters.type_cast import tf_autocast_recursively, tf_cast_recursively, dtype_pytorch2keras
 from nobuco.util import collect_recursively, replace_recursively_func
 
-
 class ChangeOrderingLayer:
-    def __init__(self, func, channel_ordering_strategy, output_types=None, autocast=False):
+    def __init__(self, func, channel_ordering_strategy, output_types=None, autocast=False, batch_first=None):
         self.func = func
         self.channel_ordering_strategy = channel_ordering_strategy
         self.output_types = output_types
         self.autocast = autocast
+        self.batch_first = batch_first
 
     def __call__(self, *args, **kwargs):
-
         if self.autocast:
             args, kwargs = tf_scalars_to_tensors_recursively((args, kwargs))
             args, kwargs = tf_autocast_recursively((args, kwargs))
@@ -22,6 +23,9 @@ class ChangeOrderingLayer:
         tf_assert_has_attr_recursively((args, kwargs), 'channel_order')
 
         strategy = self.channel_ordering_strategy
+
+        if self.batch_first is not None:
+            args, kwargs = self._handle_batch_first(args, kwargs)
 
         if strategy == ChannelOrderingStrategy.MANUAL:
             outputs = self.func(*args, **kwargs)
@@ -59,6 +63,9 @@ class ChangeOrderingLayer:
             outputs = self.func(*args, **kwargs)
             outputs = tf_annotate_recursively(outputs, channel_order=channel_order)
 
+        if self.batch_first is not None:
+            outputs = self._restore_batch_first(outputs)
+
         if self.output_types is not None:
             num_outputs_tf = len(collect_recursively(outputs, TF_TENSOR_CLASSES))
             num_outputs_pt = len(self.output_types)
@@ -72,6 +79,31 @@ class ChangeOrderingLayer:
         tf_assert_has_attr_recursively(outputs, 'channel_order')
         return outputs
 
+    def _handle_batch_first(self, args, kwargs):
+        def transpose_batch_seq(tensor):
+            if tensor.shape.ndims > 2:
+                return tf.transpose(tensor, perm=[1, 0] + list(range(2, tensor.shape.ndims)))
+            return tensor
+
+        args = [transpose_batch_seq(arg) if isinstance(arg, tf.Tensor) else arg for arg in args]
+        kwargs = {k: transpose_batch_seq(v) if isinstance(v, tf.Tensor) else v for k, v in kwargs.items()}
+        return args, kwargs
+
+    def _restore_batch_first(self, outputs):
+        def transpose_seq_batch(tensor):
+            if tensor.shape.ndims > 2:
+                return tf.transpose(tensor, perm=[1, 0] + list(range(2, tensor.shape.ndims)))
+            return tensor
+
+        if isinstance(outputs, (list, tuple)):
+            return [transpose_seq_batch(output) if isinstance(output, tf.Tensor) else output for output in outputs]
+        elif isinstance(outputs, dict):
+            return {k: transpose_seq_batch(v) if isinstance(v, tf.Tensor) else v for k, v in outputs.items()}
+        elif isinstance(outputs, tf.Tensor):
+            return transpose_seq_batch(outputs)
+        else:
+            return outputs
+
     def reset_states(self):
         if hasattr(self.func, 'reset_states'):
             self.func.reset_states()
@@ -79,9 +111,7 @@ class ChangeOrderingLayer:
     def __str__(self):
         return f"{self.__class__.__name__}(func={self.func})"
 
-
 def tf_set_order_recursively(obj, channel_order: ChannelOrder):
-
     def collect_func(obj):
         return isinstance(obj, TF_TENSOR_CLASSES)
 
@@ -97,9 +127,7 @@ def tf_set_order_recursively(obj, channel_order: ChannelOrder):
 
     return replace_recursively_func(obj, collect_func, replace_func)
 
-
 def tf_annotate_recursively(obj, channel_order):
-
     def collect_func(obj):
         return isinstance(obj, TF_TENSOR_CLASSES)
 
@@ -109,9 +137,7 @@ def tf_annotate_recursively(obj, channel_order):
 
     return replace_recursively_func(obj, collect_func, replace_func)
 
-
 def tf_assert_has_attr_recursively(obj, attr):
-
     def collect_func(obj):
         return isinstance(obj, TF_TENSOR_CLASSES)
 

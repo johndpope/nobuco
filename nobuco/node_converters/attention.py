@@ -10,7 +10,13 @@ import keras
 from nobuco.commons import ChannelOrder, ChannelOrderingStrategy
 from nobuco.converters.node_converter import converter
 
-
+from typing import Optional
+from torch import Tensor
+import torch.nn as nn
+import tensorflow as tf
+import keras
+from nobuco.commons import ChannelOrderingStrategy
+from nobuco.converters.node_converter import converter
 @converter(nn.modules.activation.MultiheadAttention, channel_ordering_strategy=ChannelOrderingStrategy.FORCE_PYTORCH_ORDER)
 def converter_MultiheadAttention(self,
             query: Tensor,
@@ -23,29 +29,29 @@ def converter_MultiheadAttention(self,
             is_causal: bool = False):
 
     assert self._qkv_same_embed_dim, 'Different embed dims are not supported yet'
-    assert self.batch_first, 'batch_first=False is not supported yet'
 
     dropout = self.dropout
-
     num_heads = self.num_heads
     head_dim = self.head_dim
     embed_dim = self.embed_dim
-
     key_dim = self.kdim // num_heads
     value_dim = self.vdim // num_heads
     use_bias = self.in_proj_bias is not None
 
     in_proj_weight = self.in_proj_weight.cpu().detach().numpy()
-    in_proj_bias = self.in_proj_bias.cpu().detach().numpy()
+    in_proj_bias = self.in_proj_bias.cpu().detach().numpy() if use_bias else None
 
     w1, w2, w3 = in_proj_weight.reshape(3, num_heads, head_dim, embed_dim).transpose(0, 3, 1, 2)
-    b1, b2, b3 = in_proj_bias.reshape(3, num_heads, head_dim)
+    if use_bias:
+        b1, b2, b3 = in_proj_bias.reshape(3, num_heads, head_dim)
+    else:
+        b1 = b2 = b3 = None
 
     w4 = self.out_proj.weight.cpu().detach().numpy()
     w4 = w4.reshape(embed_dim, num_heads, head_dim).transpose(1, 2, 0)
-    b4 = self.out_proj.bias.cpu().detach().numpy()
+    b4 = self.out_proj.bias.cpu().detach().numpy() if self.out_proj.bias is not None else None
 
-    params = [w1, b1, w2, b2, w3, b3, w4, b4]
+    params = [w for w in [w1, b1, w2, b2, w3, b3, w4, b4] if w is not None]
 
     def func(
             query,
@@ -57,14 +63,34 @@ def converter_MultiheadAttention(self,
             average_attn_weights=True,
             is_causal=False
     ):
+        # Handle batch_first=False case
+        if not self.batch_first:
+            query = tf.transpose(query, [1, 0, 2])
+            key = tf.transpose(key, [1, 0, 2])
+            value = tf.transpose(value, [1, 0, 2])
+
         layer = keras.layers.MultiHeadAttention(num_heads, key_dim, value_dim=value_dim, use_bias=use_bias, dropout=dropout)
-        layer(query, value, key=key, attention_mask=attn_mask, return_attention_scores=need_weights, use_causal_mask=is_causal)
+        
+        # Build the layer with the correct input shape
+        layer.build(input_shape=[(None, None, embed_dim)] * 3)
+        
+        # Set the weights after building the layer
         layer.set_weights(params)
+        
         output = layer(query, value, key=key, attention_mask=attn_mask, return_attention_scores=need_weights, use_causal_mask=is_causal)
+        
         if need_weights and average_attn_weights:
             attention_output, attention_scores = output
             attention_scores = tf.reduce_mean(attention_scores, axis=1)
             output = (attention_output, attention_scores)
+
+        # Handle batch_first=False case for output
+        if not self.batch_first:
+            if isinstance(output, tuple):
+                output = (tf.transpose(output[0], [1, 0, 2]), output[1])
+            else:
+                output = tf.transpose(output, [1, 0, 2])
+
         return output
     return func
 
